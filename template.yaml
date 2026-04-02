@@ -1,16 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Serverless automated data extraction pipeline using AWS Lambda, EventBridge, S3, DynamoDB, IAM, and a Python dependency layer.
+Description: Serverless automated data extraction pipeline using AWS Lambda, EventBridge, S3, DynamoDB, IAM, and Python dependency layer.
 
 Parameters:
   FunctionName:
     Type: String
     Default: serverless-automated-data-extraction
-    Description: Logical name assigned to the Lambda function and its CloudWatch log group.
+    Description: Name assigned to the Lambda function.
   SourceUrl:
     Type: String
     Default: http://books.toscrape.com/
-    Description: Web endpoint to scrape.
+    Description: HTTP endpoint to scrape.
   StorageMode:
     Type: String
     Default: BOTH
@@ -18,19 +18,19 @@ Parameters:
       - S3
       - DYNAMODB
       - BOTH
-    Description: Where the Lambda function writes extracted data.
+    Description: Destination storage mode.
   MaxPages:
-    Type: String
-    Default: '1'
-    Description: Maximum number of catalog pages to scrape per invocation.
+    Type: Number
+    Default: 1
+    Description: Maximum pages scraped per invocation.
   HttpTimeoutSeconds:
-    Type: String
-    Default: '15'
-    Description: HTTP timeout for outbound requests.
+    Type: Number
+    Default: 15
+    Description: HTTP request timeout in seconds.
   S3Prefix:
     Type: String
     Default: raw/books
-    Description: Prefix used for S3 object keys.
+    Description: S3 object prefix for JSON payloads.
   LogLevel:
     Type: String
     Default: INFO
@@ -39,7 +39,18 @@ Parameters:
       - INFO
       - WARNING
       - ERROR
-    Description: Lambda log verbosity.
+    Description: Application log level.
+  S3SseMode:
+    Type: String
+    Default: AES256
+    AllowedValues:
+      - AES256
+      - aws:kms
+    Description: Server-side encryption mode for S3 objects.
+  S3KmsKeyId:
+    Type: String
+    Default: ''
+    Description: Optional KMS Key ID/ARN used when S3SseMode is aws:kms.
 
 Resources:
   RawDataBucket:
@@ -83,6 +94,17 @@ Resources:
         - python3.10
       RetentionPolicy: Retain
 
+  LambdaDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${FunctionName}-dlq'
+      MessageRetentionPeriod: 1209600
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${FunctionName}-alerts'
+
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -95,7 +117,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: lambda-write-only-data-access
+        - PolicyName: lambda-data-pipeline-access
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -116,22 +138,26 @@ Resources:
                 Action:
                   - s3:PutObject
                 Resource:
-                  - !Sub
-                      - '${BucketArn}/*'
-                      - BucketArn: !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
               - Sid: AllowWriteToSpecificTable
                 Effect: Allow
                 Action:
                   - dynamodb:PutItem
                 Resource:
                   - !GetAtt ExtractionTable.Arn
+              - Sid: AllowWriteToDlq
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt LambdaDlq.Arn
 
   DataExtractionFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Ref FunctionName
       CodeUri: .
-      Handler: lambda_function.lambda_handler
+      Handler: src.handler.lambda_handler
       Runtime: python3.10
       Architectures:
         - x86_64
@@ -140,6 +166,9 @@ Resources:
       MemorySize: 256
       Layers:
         - !Ref DataExtractionLayer
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDlq.Arn
       Environment:
         Variables:
           BUCKET_NAME: !Ref RawDataBucket
@@ -150,6 +179,8 @@ Resources:
           HTTP_TIMEOUT_SECONDS: !Ref HttpTimeoutSeconds
           S3_PREFIX: !Ref S3Prefix
           LOG_LEVEL: !Ref LogLevel
+          S3_SSE_MODE: !Ref S3SseMode
+          S3_KMS_KEY_ID: !Ref S3KmsKeyId
 
   ExtractionScheduleRule:
     Type: AWS::Events::Rule
@@ -169,6 +200,26 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ExtractionScheduleRule.Arn
 
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-errors'
+      AlarmDescription: Alarm when Lambda execution errors exceed 0 in a period.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataExtractionFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
 Outputs:
   LambdaFunctionArn:
     Description: ARN of the Lambda function.
@@ -179,9 +230,9 @@ Outputs:
   DynamoDBTableName:
     Description: Name of the DynamoDB table storing structured records.
     Value: !Ref ExtractionTable
-  LambdaRoleArn:
-    Description: IAM role assumed by the Lambda function.
-    Value: !GetAtt LambdaExecutionRole.Arn
-  LayerVersionArn:
-    Description: ARN of the dependency layer.
-    Value: !Ref DataExtractionLayer
+  AlertsTopicArn:
+    Description: SNS topic receiving alarm notifications.
+    Value: !Ref AlertsTopic
+  LambdaDlqUrl:
+    Description: SQS dead letter queue URL.
+    Value: !Ref LambdaDlq
