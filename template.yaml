@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless automated data extraction pipeline using AWS Lambda, EventBridge, S3, DynamoDB, IAM, and a Python dependency layer.
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: serverless-automated-data-extraction
+    Description: Logical name assigned to the Lambda function and its CloudWatch log group.
+  SourceUrl:
+    Type: String
+    Default: http://books.toscrape.com/
+    Description: Web endpoint to scrape.
+  StorageMode:
+    Type: String
+    Default: BOTH
+    AllowedValues:
+      - S3
+      - DYNAMODB
+      - BOTH
+    Description: Where the Lambda function writes extracted data.
+  MaxPages:
+    Type: String
+    Default: '1'
+    Description: Maximum number of catalog pages to scrape per invocation.
+  HttpTimeoutSeconds:
+    Type: String
+    Default: '15'
+    Description: HTTP timeout for outbound requests.
+  S3Prefix:
+    Type: String
+    Default: raw/books
+    Description: Prefix used for S3 object keys.
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Description: Lambda log verbosity.
+
+Resources:
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  ExtractionTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: item_id
+          AttributeType: S
+        - AttributeName: extraction_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: item_id
+          KeyType: HASH
+        - AttributeName: extraction_timestamp
+          KeyType: RANGE
+
+  DataExtractionLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: python3.10
+    Properties:
+      LayerName: data-extraction-dependencies
+      Description: Dependencies for requests and BeautifulSoup4.
+      ContentUri: layer/data_extraction_layer/
+      CompatibleRuntimes:
+        - python3.10
+      RetentionPolicy: Retain
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FunctionName}-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: lambda-write-only-data-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCreateLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: '*'
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*'
+              - Sid: AllowWriteToSpecificBucket
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                      - '${BucketArn}/*'
+                      - BucketArn: !GetAtt RawDataBucket.Arn
+              - Sid: AllowWriteToSpecificTable
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt ExtractionTable.Arn
+
+  DataExtractionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      CodeUri: .
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.10
+      Architectures:
+        - x86_64
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref DataExtractionLayer
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref RawDataBucket
+          TABLE_NAME: !Ref ExtractionTable
+          STORAGE_MODE: !Ref StorageMode
+          SOURCE_URL: !Ref SourceUrl
+          MAX_PAGES: !Ref MaxPages
+          HTTP_TIMEOUT_SECONDS: !Ref HttpTimeoutSeconds
+          S3_PREFIX: !Ref S3Prefix
+          LOG_LEVEL: !Ref LogLevel
+
+  ExtractionScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers the data extraction Lambda every 12 hours.
+      ScheduleExpression: cron(0 */12 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataExtractionFunction.Arn
+          Id: DataExtractionFunctionTarget
+
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataExtractionFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExtractionScheduleRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function.
+    Value: !GetAtt DataExtractionFunction.Arn
+  S3BucketName:
+    Description: Name of the S3 bucket storing raw JSON output.
+    Value: !Ref RawDataBucket
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table storing structured records.
+    Value: !Ref ExtractionTable
+  LambdaRoleArn:
+    Description: IAM role assumed by the Lambda function.
+    Value: !GetAtt LambdaExecutionRole.Arn
+  LayerVersionArn:
+    Description: ARN of the dependency layer.
+    Value: !Ref DataExtractionLayer
